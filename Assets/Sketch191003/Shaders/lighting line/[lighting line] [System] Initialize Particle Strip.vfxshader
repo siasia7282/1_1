@@ -1,0 +1,410 @@
+//[lighting line] [System] Initialize Particle Strip,0
+//Don't delete the previous line or this one
+#pragma kernel CSMain
+#pragma only_renderers d3d11 metal vulkan xboxone xboxone xboxseries playstation ps5
+
+
+#pragma enable_d3d11_debug_symbols
+
+#define NB_THREADS_PER_GROUP 64
+#define HAS_VFX_ATTRIBUTES 1
+#define VFX_PASSDEPTH_ACTUAL (0)
+#define VFX_PASSDEPTH_MOTION_VECTOR (1)
+#define VFX_PASSDEPTH_SELECTION (2)
+#define VFX_PASSDEPTH_PICKING (3)
+#define VFX_PASSDEPTH_SHADOW (4)
+#define VFX_USE_ALIVE_CURRENT 1
+#define VFX_USE_POSITION_CURRENT 1
+#define VFX_USE_LIFETIME_CURRENT 1
+#define VFX_USE_STRIPINDEX_CURRENT 1
+#define VFX_USE_VELOCITY_CURRENT 1
+#define VFX_USE_AGE_CURRENT 1
+#define VFX_USE_PARTICLEID_CURRENT 1
+#define VFX_USE_POSITION_SOURCE 1
+#define STRIP_COUNT 3000u
+#define PARTICLE_PER_STRIP_COUNT 1200u
+#define RAW_CAPACITY 3600000u
+#define VFX_USE_SPAWNER_FROM_GPU 1
+#define HAS_STRIPS 1
+#define VFX_STATIC_SOURCE_COUNT (0)
+#define VFX_LOCAL_SPACE 1
+#include_with_pragmas "Packages/com.unity.render-pipelines.high-definition/Runtime/VFXGraph/Shaders/VFXDefines.hlsl"
+#define VFX_USE_GRAPH_VALUES 1
+#define VFX_USE_INSTANCING 1
+#define VFX_INSTANCING_VARIABLE_SIZE 1
+#define VFX_INSTANCING_ACTIVE_INDIRECTION 1
+#define VFX_INSTANCING_BATCH_INDIRECTION 1
+
+
+
+struct GraphValues
+{
+    bool _vfx_enabled_a;
+    bool _Alive_a;
+    bool _vfx_enabled_b;
+    bool _vfx_enabled_c;
+    float3 uniform_a;
+    float3 uniform_b;
+    int uniform_c;
+    float3 uniform_d;
+    bool _vfx_enabled_d;
+    float _Lifetime_a;
+    bool _vfx_enabled_e;
+    float4x4 uniform_e;
+    uint uniform_g;
+    uint uniform_h;
+};
+ByteAddressBuffer graphValuesBuffer;
+
+
+ByteAddressBuffer buffer_f;
+
+struct VFXAttributes
+{
+    bool alive;
+    float3 position;
+    float lifetime;
+    uint stripIndex;
+    float3 velocity;
+    float age;
+    uint particleId;
+};
+
+struct VFXSourceAttributes
+{
+    float3 position;
+};
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// Strips tangent computation
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#define USE_DEAD_LIST (VFX_USE_ALIVE_CURRENT && !HAS_STRIPS)
+#define instancingPrefixSumOffset 0
+
+RWByteAddressBuffer attributeBuffer;
+ByteAddressBuffer sourceAttributeBuffer;
+
+
+#if !VFX_USE_SPAWNER_FROM_GPU
+    StructuredBuffer<uint> spawnBuffer;
+    #define EVENT_PREFIX_SUM(index)         spawnBuffer[index]
+    #define SPAWNCOUNT_PREFIX_SUM_OFFSET    instancingActiveCount
+#endif
+
+
+CBUFFER_START(initParamsConst)
+    uint dispatchWidth;
+    
+    float4 instancingConstants;
+    uint2 instancingBufferOffsets;
+    
+CBUFFER_END
+
+#if USE_DEAD_LIST
+RWStructuredBuffer<uint> deadList;
+#endif
+
+#if VFX_USE_SPAWNER_FROM_GPU
+StructuredBuffer<uint> eventList;
+#endif
+
+#if HAS_STRIPS_DATA
+RWStructuredBuffer<uint> stripDataBuffer;
+#endif
+
+#include "Packages/com.unity.visualeffectgraph/Shaders/Common/VFXCommonCompute.hlsl"
+#include "Packages/com.unity.visualeffectgraph/Shaders/VFXCommon.hlsl"
+
+
+
+void SetAttribute_ED2BDC15(inout bool alive, bool _Alive) /*channels:XYZ */
+{
+    alive = _Alive;
+}
+void SetAttribute_CAC02F9E(inout float3 position, float3 Value) /*channels:XYZ */
+{
+    position = Value;
+}
+void SetAttribute_C707D62A(inout float3 position, float3 _Position) /*channels:XYZ */
+{
+    position += _Position;
+}
+void SetAttribute_F0142CB9(inout float lifetime, float _Lifetime) /*channels:XYZ */
+{
+    lifetime = _Lifetime;
+}
+void SetAttribute_CAC29747(inout float3 position, float3 _Position) /*channels:XYZ */
+{
+    position = _Position;
+}
+
+
+
+#if HAS_STRIPS
+bool GetParticleIndex(inout uint particleIndex, uint stripIndex, uint instanceIndex)
+{
+    uint relativeIndex;
+    uint bufferIndex = STRIP_DATA_INDEX(instanceIndex, stripIndex);
+
+    InterlockedAdd(STRIP_DATA(STRIP_NEXT_INDEX, bufferIndex), 1, relativeIndex);
+    bool isFull = relativeIndex >= PARTICLE_PER_STRIP_COUNT;
+    if (isFull)
+    {
+        InterlockedAdd(STRIP_DATA(STRIP_NEXT_INDEX, bufferIndex), -1); // Remove previous increment
+    }
+    else
+    {
+        particleIndex = stripIndex * PARTICLE_PER_STRIP_COUNT + ((STRIP_DATA(STRIP_FIRST_INDEX, bufferIndex) + relativeIndex) % PARTICLE_PER_STRIP_COUNT);
+    }
+
+    return !isFull;
+}
+#endif
+
+[numthreads(NB_THREADS_PER_GROUP,1,1)]
+void CSMain(uint3 groupId          : SV_GroupID,
+            uint3 groupThreadId    : SV_GroupThreadID)
+{
+    uint id = groupThreadId.x + groupId.x * NB_THREADS_PER_GROUP;
+#if !VFX_USE_SPAWNER_FROM_GPU
+    id += groupId.y * dispatchWidth * NB_THREADS_PER_GROUP;
+#endif
+    
+    uint instanceIndex, instanceActiveIndex, instanceCurrentIndex;
+    #if defined(VFX_INSTANCING_FIXED_SIZE)
+    	uint index = GetThreadId(groupId, 0, dispatchWidth);
+    	index = VFXInitInstancing(index, instanceIndex, instanceActiveIndex, instanceCurrentIndex);
+    	index += groupThreadId.x;
+    #else
+    	uint index = VFXInitInstancing(id, instanceIndex, instanceActiveIndex, instanceCurrentIndex);
+    #endif
+    
+    
+
+	struct ContextData
+	{
+	    uint maxParticleCount;
+	    uint systemSeed;
+	    uint initSpawnIndex;
+	};
+	ContextData contextData;
+	uint4 rawContextData = graphValuesBuffer.Load4(instanceActiveIndex * 640);
+	contextData.maxParticleCount = rawContextData.x;
+	contextData.systemSeed = rawContextData.y;
+	contextData.initSpawnIndex = rawContextData.z;
+	
+
+	uint systemSeed = contextData.systemSeed;
+
+    GraphValues graphValues;
+    
+    graphValues.uniform_e._m00_m10_m20_m30 = asfloat(graphValuesBuffer.Load4(instanceActiveIndex * 640  + 16));
+    graphValues.uniform_e._m01_m11_m21_m31 = asfloat(graphValuesBuffer.Load4(instanceActiveIndex * 640  + 32));
+    graphValues.uniform_e._m02_m12_m22_m32 = asfloat(graphValuesBuffer.Load4(instanceActiveIndex * 640  + 48));
+    graphValues.uniform_e._m03_m13_m23_m33 = asfloat(graphValuesBuffer.Load4(instanceActiveIndex * 640  + 64));
+    graphValues.uniform_a = asfloat(graphValuesBuffer.Load3(instanceActiveIndex * 640  + 368));
+    graphValues._vfx_enabled_a = (bool)graphValuesBuffer.Load(instanceActiveIndex * 640  + 380);
+    graphValues.uniform_b = asfloat(graphValuesBuffer.Load3(instanceActiveIndex * 640  + 384));
+    graphValues._Alive_a = (bool)graphValuesBuffer.Load(instanceActiveIndex * 640  + 396);
+    graphValues.uniform_d = asfloat(graphValuesBuffer.Load3(instanceActiveIndex * 640  + 400));
+    graphValues._vfx_enabled_b = (bool)graphValuesBuffer.Load(instanceActiveIndex * 640  + 412);
+    graphValues._vfx_enabled_c = (bool)graphValuesBuffer.Load(instanceActiveIndex * 640  + 428);
+    graphValues.uniform_c = asint(graphValuesBuffer.Load(instanceActiveIndex * 640  + 444));
+    graphValues._vfx_enabled_d = (bool)graphValuesBuffer.Load(instanceActiveIndex * 640  + 460);
+    graphValues._Lifetime_a = asfloat(graphValuesBuffer.Load(instanceActiveIndex * 640  + 476));
+    graphValues._vfx_enabled_e = (bool)graphValuesBuffer.Load(instanceActiveIndex * 640  + 492);
+    graphValues.uniform_g = graphValuesBuffer.Load(instanceActiveIndex * 640  + 496);
+    graphValues.uniform_h = graphValuesBuffer.Load(instanceActiveIndex * 640  + 500);
+    
+
+
+#if VFX_USE_SPAWNER_FROM_GPU
+    uint elementCount = eventList[VFXGetEventListBufferElementCount(instanceActiveIndex)];
+    uint totalAccumulatedElementCount = eventList[VFXGetEventListBufferAccumulatedCount(instanceActiveIndex)];
+    uint maxThreadId = min(contextData.maxParticleCount, elementCount);
+    uint currentSpawnIndex = totalAccumulatedElementCount - elementCount;
+#else
+    uint nbEvents = EVENT_PREFIX_SUM(instanceActiveIndex);
+    [branch]
+    if (instanceActiveIndex > 0u)
+    {
+        nbEvents -= EVENT_PREFIX_SUM(instanceActiveIndex - 1);
+    }
+
+    uint maxThreadId = instancingPrefixSum[instancingPrefixSumOffset + instanceCurrentIndex];
+    [branch]
+    if (instanceCurrentIndex > instancingCurrentOffset)
+    {
+        maxThreadId -= instancingPrefixSum[instancingPrefixSumOffset + instanceCurrentIndex - 1];
+    }
+    uint currentSpawnIndex = contextData.initSpawnIndex;
+#endif
+
+#if USE_DEAD_LIST
+    maxThreadId = min(maxThreadId, deadList[DEAD_LIST_COUNT_COPY_OFFSET + instanceIndex]);
+#endif
+
+    if (index < maxThreadId)
+    {
+#if VFX_USE_SPAWNER_FROM_GPU
+        int sourceIndex = eventList[VFXGetEventListBufferIndex(id, instanceActiveIndex)];
+#endif
+
+        uint startEventIndex = 0u; //tmp for GPU Events
+#if !VFX_USE_SPAWNER_FROM_GPU
+        int sourceIndex = 0;
+
+        startEventIndex = 0;
+        [branch]
+        if (instanceActiveIndex > 0u)
+        {
+            startEventIndex = EVENT_PREFIX_SUM(instanceActiveIndex - 1);
+        }
+        uint sourceSearchBegin = startEventIndex + SPAWNCOUNT_PREFIX_SUM_OFFSET;
+        uint sourceSearchEnd = sourceSearchBegin + nbEvents;
+        sourceIndex = BinarySearchPrefixSum(index, spawnBuffer, sourceSearchBegin, sourceSearchEnd) - sourceSearchBegin;
+
+#endif
+
+		VFXAttributes attributes = (VFXAttributes)0;
+		VFXSourceAttributes sourceAttributes = (VFXSourceAttributes)0;
+
+        attributes.alive = (bool)true;
+        attributes.position = float3(0, 0, 0);
+        attributes.lifetime = (float)1;
+        attributes.stripIndex = (uint)0;
+        attributes.velocity = float3(0, 0, 0);
+        attributes.age = (float)0;
+        attributes.particleId = (uint)0;
+        sourceAttributes.position = asfloat(sourceAttributeBuffer.Load3(((startEventIndex * 0x4) + (sourceIndex * 0x4 + 0x0)) << 2));
+        
+
+
+		uint particleIndex = index + currentSpawnIndex;
+#if VFX_USE_PARTICLEID_CURRENT
+         attributes.particleId = particleIndex;
+#endif
+#if VFX_USE_SEED_CURRENT
+        attributes.seed = WangHash(particleIndex ^ systemSeed);
+#endif
+#if VFX_USE_SPAWNINDEX_CURRENT
+        attributes.spawnIndex = index;
+#endif
+
+#if VFX_USE_SPAWNER_FROM_GPU && VFX_USE_SPAWNCOUNT_SOURCE
+    //Fix previously incorrectly read or initialized source spawnCount
+    sourceAttributes.spawnCount = (float)elementCount;
+#endif
+
+#if HAS_STRIPS
+#if !VFX_USE_SPAWNER_FROM_GPU
+		
+#else
+        uint stripIndex = sourceIndex;
+#endif
+		stripIndex = min(stripIndex, STRIP_COUNT);
+
+        if (!GetParticleIndex(particleIndex, stripIndex, instanceIndex))
+            return;
+
+        const StripData stripData = GetStripDataFromStripIndex(stripIndex, instanceIndex);
+		InitStripAttributesWithSpawn(maxThreadId, particleIndex, attributes, stripData);
+		// TODO Change seed to be sure we're deterministic on random with strip
+#endif
+
+        if (graphValues._vfx_enabled_a)
+        {
+            SetAttribute_ED2BDC15( /*inout */attributes.alive, graphValues._Alive_a);
+        }
+        if (graphValues._vfx_enabled_b)
+        {
+            float3 tmp_bl = sourceAttributes.position;
+            SetAttribute_CAC02F9E( /*inout */attributes.position, tmp_bl);
+        }
+        if (graphValues._vfx_enabled_c)
+        {
+            float tmp_bl = (float)attributes.stripIndex;
+            float3 tmp_bm = float3(tmp_bl, tmp_bl, tmp_bl);
+            float3 tmp_bn = tmp_bm * graphValues.uniform_a;
+            float3 tmp_bo = attributes.position + tmp_bn;
+            float3 tmp_bp = GeneratePerlinCurlNoise(tmp_bo, graphValues.uniform_b.x, graphValues.uniform_c, graphValues.uniform_b.y, graphValues.uniform_b.z);
+            float3 tmp_bq = tmp_bp * graphValues.uniform_d;
+            SetAttribute_C707D62A( /*inout */attributes.position, tmp_bq);
+        }
+        if (graphValues._vfx_enabled_d)
+        {
+            SetAttribute_F0142CB9( /*inout */attributes.lifetime, graphValues._Lifetime_a);
+        }
+        if (graphValues._vfx_enabled_e)
+        {
+            float3 tmp_bl = SampleMeshFloat3(buffer_f, graphValues.uniform_g, graphValues.uniform_h);
+            float3 tmp_bm = mul(graphValues.uniform_e, float4(tmp_bl, 1.0)).xyz;
+            SetAttribute_CAC29747( /*inout */attributes.position, tmp_bm);
+        }
+        
+
+
+#if VFX_USE_ALIVE_CURRENT
+        if (attributes.alive)
+#endif
+        {
+#if USE_DEAD_LIST
+            uint deadIndex;
+            InterlockedAdd(deadList[instanceIndex], -1, deadIndex);
+            deadIndex -= 1;
+            deadIndex += DEAD_LIST_OFFSET + instanceIndex * RAW_CAPACITY;
+            uint index = deadList[deadIndex];
+#else
+            uint index = particleIndex;
+#endif
+            attributeBuffer.Store(((instanceIndex * 0x2CA1C80) + (index * 0x4 + 0x3)) << 2,uint(attributes.alive));
+            attributeBuffer.Store3(((instanceIndex * 0x2CA1C80) + (index * 0x8 + 0xDBBA00)) << 2,asuint(attributes.position));
+            attributeBuffer.Store(((instanceIndex * 0x2CA1C80) + (index * 0x8 + 0xDBBA03)) << 2,asuint(attributes.lifetime));
+            attributeBuffer.Store3(((instanceIndex * 0x2CA1C80) + (index * 0x4 + 0x0)) << 2,asuint(attributes.velocity));
+            attributeBuffer.Store(((instanceIndex * 0x2CA1C80) + (index * 0x8 + 0xDBBA04)) << 2,asuint(attributes.age));
+            attributeBuffer.Store(((instanceIndex * 0x2CA1C80) + (index * 0x1 + 0x2932E00)) << 2,asuint(attributes.particleId));
+            
+
+        }
+    }
+}
